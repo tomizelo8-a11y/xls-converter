@@ -4,18 +4,17 @@ import os
 import io
 
 app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = 200 * 1024 * 1024  # 200MB max upload
 
 HTML_PAGE = '''<!DOCTYPE html>
 <html lang="id">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>XLS Converter — Telkom</title>
+<title>XLS Converter — HD Internal Tool</title>
 <style>
   @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
-
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-
   body {
     font-family: 'Inter', sans-serif;
     background: #0f1117;
@@ -27,7 +26,6 @@ HTML_PAGE = '''<!DOCTYPE html>
     justify-content: center;
     padding: 24px;
   }
-
   .card {
     background: #1a1d27;
     border: 1px solid #2d3147;
@@ -36,7 +34,6 @@ HTML_PAGE = '''<!DOCTYPE html>
     width: 100%;
     max-width: 480px;
   }
-
   .badge {
     display: inline-block;
     background: #1e3a5f;
@@ -49,22 +46,8 @@ HTML_PAGE = '''<!DOCTYPE html>
     border-radius: 20px;
     margin-bottom: 16px;
   }
-
-  h1 {
-    font-size: 22px;
-    font-weight: 700;
-    color: #f1f5f9;
-    margin-bottom: 8px;
-    line-height: 1.3;
-  }
-
-  p.desc {
-    font-size: 13px;
-    color: #64748b;
-    margin-bottom: 28px;
-    line-height: 1.6;
-  }
-
+  h1 { font-size: 22px; font-weight: 700; color: #f1f5f9; margin-bottom: 8px; line-height: 1.3; }
+  p.desc { font-size: 13px; color: #64748b; margin-bottom: 28px; line-height: 1.6; }
   .drop-zone {
     border: 2px dashed #2d3147;
     border-radius: 12px;
@@ -75,28 +58,12 @@ HTML_PAGE = '''<!DOCTYPE html>
     position: relative;
     margin-bottom: 20px;
   }
-
-  .drop-zone:hover, .drop-zone.dragover {
-    border-color: #3b82f6;
-    background: #1e2235;
-  }
-
-  .drop-zone input[type="file"] {
-    position: absolute;
-    inset: 0;
-    opacity: 0;
-    cursor: pointer;
-    width: 100%;
-    height: 100%;
-  }
-
+  .drop-zone:hover, .drop-zone.dragover { border-color: #3b82f6; background: #1e2235; }
+  .drop-zone input[type="file"] { position: absolute; inset: 0; opacity: 0; cursor: pointer; width: 100%; height: 100%; }
   .drop-icon { font-size: 32px; margin-bottom: 10px; }
-
   .drop-label { font-size: 14px; color: #94a3b8; }
   .drop-label span { color: #3b82f6; font-weight: 600; }
-
   .file-name { font-size: 12px; color: #60a5fa; margin-top: 8px; font-weight: 500; }
-
   button[type="submit"] {
     width: 100%;
     padding: 13px;
@@ -109,14 +76,31 @@ HTML_PAGE = '''<!DOCTYPE html>
     cursor: pointer;
     transition: background 0.2s, opacity 0.2s;
   }
-
   button[type="submit"]:hover { background: #2563eb; }
   button[type="submit"]:disabled { opacity: 0.5; cursor: not-allowed; }
-
   .status { margin-top: 16px; font-size: 13px; text-align: center; color: #64748b; min-height: 20px; }
   .status.success { color: #34d399; }
   .status.error { color: #f87171; }
-
+  .progress-bar {
+    width: 100%;
+    height: 4px;
+    background: #2d3147;
+    border-radius: 4px;
+    margin-top: 12px;
+    display: none;
+    overflow: hidden;
+  }
+  .progress-fill {
+    height: 100%;
+    background: #3b82f6;
+    border-radius: 4px;
+    animation: progress 3s ease-in-out infinite;
+  }
+  @keyframes progress {
+    0% { width: 0%; }
+    50% { width: 70%; }
+    100% { width: 95%; }
+  }
   .info {
     margin-top: 24px;
     padding: 14px 16px;
@@ -127,7 +111,6 @@ HTML_PAGE = '''<!DOCTYPE html>
     color: #64748b;
     line-height: 1.6;
   }
-
   .info b { color: #94a3b8; }
 </style>
 </head>
@@ -137,7 +120,7 @@ HTML_PAGE = '''<!DOCTYPE html>
   <h1>XLS Fulfillment Converter</h1>
   <p class="desc">Upload file .xls yang sudah diedit di WPS/Excel. File akan dikonversi balik ke format HTML-XLS agar bisa diupload ke sistem web.</p>
 
-  <form id="uploadForm" method="POST" action="/convert" enctype="multipart/form-data">
+  <form id="uploadForm" enctype="multipart/form-data">
     <div class="drop-zone" id="dropZone">
       <input type="file" name="file" id="fileInput" accept=".xls">
       <div class="drop-icon">📂</div>
@@ -145,6 +128,7 @@ HTML_PAGE = '''<!DOCTYPE html>
       <div class="file-name" id="fileName"></div>
     </div>
     <button type="submit" id="submitBtn" disabled>Konversi & Download</button>
+    <div class="progress-bar" id="progressBar"><div class="progress-fill"></div></div>
   </form>
 
   <div class="status" id="status"></div>
@@ -164,10 +148,11 @@ HTML_PAGE = '''<!DOCTYPE html>
   const dropZone = document.getElementById('dropZone');
   const status = document.getElementById('status');
   const form = document.getElementById('uploadForm');
+  const progressBar = document.getElementById('progressBar');
 
   fileInput.addEventListener('change', () => {
     if (fileInput.files[0]) {
-      fileName.textContent = fileInput.files[0].name;
+      fileName.textContent = fileInput.files[0].name + ' (' + (fileInput.files[0].size/1024/1024).toFixed(1) + ' MB)';
       submitBtn.disabled = false;
       status.textContent = '';
       status.className = 'status';
@@ -189,17 +174,24 @@ HTML_PAGE = '''<!DOCTYPE html>
 
     submitBtn.disabled = true;
     submitBtn.textContent = 'Memproses...';
-    status.textContent = 'Sedang mengkonversi file...';
+    status.textContent = 'Sedang mengkonversi, harap tunggu (file besar ~1-2 menit)...';
     status.className = 'status';
+    progressBar.style.display = 'block';
 
-    const formData = new FormData(form);
+    const formData = new FormData();
+    formData.append('file', fileInput.files[0]);
 
     try {
-      const res = await fetch('/convert', { method: 'POST', body: formData });
+      const res = await fetch('/convert', {
+        method: 'POST',
+        body: formData
+      });
+
       if (!res.ok) {
         const err = await res.text();
         throw new Error(err);
       }
+
       const blob = await res.blob();
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
@@ -208,9 +200,11 @@ HTML_PAGE = '''<!DOCTYPE html>
       a.click();
       URL.revokeObjectURL(url);
 
+      progressBar.style.display = 'none';
       status.textContent = '✅ Berhasil! File sudah didownload.';
       status.className = 'status success';
     } catch (err) {
+      progressBar.style.display = 'none';
       status.textContent = '❌ Gagal: ' + err.message;
       status.className = 'status error';
     } finally {
@@ -230,7 +224,7 @@ def index():
 def convert():
     if 'file' not in request.files:
         return 'Tidak ada file', 400
-    
+
     file = request.files['file']
     if file.filename == '':
         return 'Nama file kosong', 400
@@ -277,4 +271,4 @@ xmlns="http://www.w3.org/TR/REC-html40">
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
-    app.run(debug=False, host='0.0.0.0', port=port)
+    app.run(debug=False, host='0.0.0.0', port=port, threaded=True)
