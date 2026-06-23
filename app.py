@@ -1,10 +1,15 @@
-from flask import Flask, request, send_file, render_template_string
+from flask import Flask, request, send_file, render_template_string, jsonify
 import pandas as pd
 import os
 import io
+import uuid
+import threading
 
 app = Flask(__name__)
-app.config['MAX_CONTENT_LENGTH'] = 200 * 1024 * 1024  # 200MB max upload
+app.config['MAX_CONTENT_LENGTH'] = 200 * 1024 * 1024
+
+# Simpan hasil di memory sementara
+results = {}
 
 HTML_PAGE = '''<!DOCTYPE html>
 <html lang="id">
@@ -46,7 +51,7 @@ HTML_PAGE = '''<!DOCTYPE html>
     border-radius: 20px;
     margin-bottom: 16px;
   }
-  h1 { font-size: 22px; font-weight: 700; color: #f1f5f9; margin-bottom: 8px; line-height: 1.3; }
+  h1 { font-size: 22px; font-weight: 700; color: #f1f5f9; margin-bottom: 8px; }
   p.desc { font-size: 13px; color: #64748b; margin-bottom: 28px; line-height: 1.6; }
   .drop-zone {
     border: 2px dashed #2d3147;
@@ -65,53 +70,27 @@ HTML_PAGE = '''<!DOCTYPE html>
   .drop-label span { color: #3b82f6; font-weight: 600; }
   .file-name { font-size: 12px; color: #60a5fa; margin-top: 8px; font-weight: 500; }
   button[type="submit"] {
-    width: 100%;
-    padding: 13px;
-    background: #3b82f6;
-    color: #fff;
-    font-size: 14px;
-    font-weight: 600;
-    border: none;
-    border-radius: 10px;
-    cursor: pointer;
-    transition: background 0.2s, opacity 0.2s;
+    width: 100%; padding: 13px;
+    background: #3b82f6; color: #fff;
+    font-size: 14px; font-weight: 600;
+    border: none; border-radius: 10px;
+    cursor: pointer; transition: background 0.2s;
   }
   button[type="submit"]:hover { background: #2563eb; }
   button[type="submit"]:disabled { opacity: 0.5; cursor: not-allowed; }
   .status { margin-top: 16px; font-size: 13px; text-align: center; color: #64748b; min-height: 20px; }
   .status.success { color: #34d399; }
   .status.error { color: #f87171; }
-  .progress-bar {
-    width: 100%;
-    height: 4px;
-    background: #2d3147;
-    border-radius: 4px;
-    margin-top: 12px;
-    display: none;
-    overflow: hidden;
-  }
-  .progress-fill {
-    height: 100%;
-    background: #3b82f6;
-    border-radius: 4px;
-    animation: progress 3s ease-in-out infinite;
-  }
-  @keyframes progress {
-    0% { width: 0%; }
-    50% { width: 70%; }
-    100% { width: 95%; }
-  }
-  .info {
-    margin-top: 24px;
-    padding: 14px 16px;
-    background: #12151f;
-    border-radius: 10px;
+  .status.info { color: #60a5fa; }
+  .progress-bar { width: 100%; height: 4px; background: #2d3147; border-radius: 4px; margin-top: 12px; display: none; overflow: hidden; }
+  .progress-fill { height: 100%; background: #3b82f6; border-radius: 4px; width: 0%; transition: width 0.5s; }
+  .info-box {
+    margin-top: 24px; padding: 14px 16px;
+    background: #12151f; border-radius: 10px;
     border-left: 3px solid #3b82f6;
-    font-size: 12px;
-    color: #64748b;
-    line-height: 1.6;
+    font-size: 12px; color: #64748b; line-height: 1.6;
   }
-  .info b { color: #94a3b8; }
+  .info-box b { color: #94a3b8; }
 </style>
 </head>
 <body>
@@ -128,12 +107,12 @@ HTML_PAGE = '''<!DOCTYPE html>
       <div class="file-name" id="fileName"></div>
     </div>
     <button type="submit" id="submitBtn" disabled>Konversi & Download</button>
-    <div class="progress-bar" id="progressBar"><div class="progress-fill"></div></div>
+    <div class="progress-bar" id="progressBar"><div class="progress-fill" id="progressFill"></div></div>
   </form>
 
   <div class="status" id="status"></div>
 
-  <div class="info">
+  <div class="info-box">
     <b>Cara pakai:</b><br>
     1. Edit file .xls seperti biasa di WPS/Excel<br>
     2. Upload file yang sudah diedit ke sini<br>
@@ -147,12 +126,14 @@ HTML_PAGE = '''<!DOCTYPE html>
   const submitBtn = document.getElementById('submitBtn');
   const dropZone = document.getElementById('dropZone');
   const status = document.getElementById('status');
-  const form = document.getElementById('uploadForm');
   const progressBar = document.getElementById('progressBar');
+  const progressFill = document.getElementById('progressFill');
+  let originalFileName = '';
 
   fileInput.addEventListener('change', () => {
     if (fileInput.files[0]) {
-      fileName.textContent = fileInput.files[0].name + ' (' + (fileInput.files[0].size/1024/1024).toFixed(1) + ' MB)';
+      originalFileName = fileInput.files[0].name;
+      fileName.textContent = originalFileName + ' (' + (fileInput.files[0].size/1024/1024).toFixed(1) + ' MB)';
       submitBtn.disabled = false;
       status.textContent = '';
       status.className = 'status';
@@ -168,46 +149,73 @@ HTML_PAGE = '''<!DOCTYPE html>
     fileInput.dispatchEvent(new Event('change'));
   });
 
-  form.addEventListener('submit', async (e) => {
+  document.getElementById('uploadForm').addEventListener('submit', async (e) => {
     e.preventDefault();
     if (!fileInput.files[0]) return;
 
     submitBtn.disabled = true;
-    submitBtn.textContent = 'Memproses...';
-    status.textContent = 'Sedang mengkonversi, harap tunggu (file besar ~1-2 menit)...';
-    status.className = 'status';
+    submitBtn.textContent = 'Mengupload...';
+    status.textContent = 'Mengupload file...';
+    status.className = 'status info';
     progressBar.style.display = 'block';
+    progressFill.style.width = '10%';
 
     const formData = new FormData();
     formData.append('file', fileInput.files[0]);
 
     try {
-      const res = await fetch('/convert', {
-        method: 'POST',
-        body: formData
-      });
+      // Upload file dan mulai proses di background
+      const uploadRes = await fetch('/upload', { method: 'POST', body: formData });
+      const uploadData = await uploadRes.json();
 
-      if (!res.ok) {
-        const err = await res.text();
-        throw new Error(err);
-      }
+      if (!uploadData.job_id) throw new Error('Upload gagal');
 
-      const blob = await res.blob();
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = fileInput.files[0].name;
-      a.click();
-      URL.revokeObjectURL(url);
+      progressFill.style.width = '30%';
+      status.textContent = 'File diupload, sedang diproses...';
+      submitBtn.textContent = 'Memproses...';
 
-      progressBar.style.display = 'none';
-      status.textContent = '✅ Berhasil! File sudah didownload.';
-      status.className = 'status success';
+      // Polling status setiap 3 detik
+      let attempts = 0;
+      const poll = setInterval(async () => {
+        attempts++;
+        progressFill.style.width = Math.min(30 + attempts * 10, 90) + '%';
+
+        const statusRes = await fetch('/status/' + uploadData.job_id);
+        const statusData = await statusRes.json();
+
+        if (statusData.status === 'done') {
+          clearInterval(poll);
+          progressFill.style.width = '100%';
+
+          // Download file
+          const dlRes = await fetch('/download/' + uploadData.job_id);
+          const blob = await dlRes.blob();
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = originalFileName;
+          a.click();
+          URL.revokeObjectURL(url);
+
+          progressBar.style.display = 'none';
+          status.textContent = '✅ Berhasil! File sudah didownload.';
+          status.className = 'status success';
+          submitBtn.disabled = false;
+          submitBtn.textContent = 'Konversi & Download';
+
+        } else if (statusData.status === 'error') {
+          clearInterval(poll);
+          throw new Error(statusData.message);
+        } else if (attempts > 40) {
+          clearInterval(poll);
+          throw new Error('Timeout — file terlalu besar atau server sibuk');
+        }
+      }, 3000);
+
     } catch (err) {
       progressBar.style.display = 'none';
       status.textContent = '❌ Gagal: ' + err.message;
       status.className = 'status error';
-    } finally {
       submitBtn.disabled = false;
       submitBtn.textContent = 'Konversi & Download';
     }
@@ -220,21 +228,25 @@ HTML_PAGE = '''<!DOCTYPE html>
 def index():
     return render_template_string(HTML_PAGE)
 
-@app.route('/convert', methods=['POST'])
-def convert():
+@app.route('/upload', methods=['POST'])
+def upload():
     if 'file' not in request.files:
-        return 'Tidak ada file', 400
+        return jsonify({'error': 'Tidak ada file'}), 400
 
     file = request.files['file']
-    if file.filename == '':
-        return 'Nama file kosong', 400
+    file_data = file.read()
+    filename = file.filename
+    job_id = str(uuid.uuid4())
 
-    try:
-        df = pd.read_html(file.stream)[0]
-        df.columns = df.iloc[0]
-        df = df[1:].reset_index(drop=True)
+    results[job_id] = {'status': 'processing', 'filename': filename}
 
-        html_content = '''<html xmlns:o="urn:schemas-microsoft-com:office:office"
+    def process(job_id, file_data, filename):
+        try:
+            df = pd.read_html(io.BytesIO(file_data))[0]
+            df.columns = df.iloc[0]
+            df = df[1:].reset_index(drop=True)
+
+            html_content = '''<html xmlns:o="urn:schemas-microsoft-com:office:office"
 xmlns:x="urn:schemas-microsoft-com:office:excel"
 xmlns="http://www.w3.org/TR/REC-html40">
 <head>
@@ -254,21 +266,45 @@ xmlns="http://www.w3.org/TR/REC-html40">
 </head>
 <body>
 '''
-        html_content += df.to_html(index=False, na_rep='', border=1)
-        html_content += '\n</body>\n</html>'
+            html_content += df.to_html(index=False, na_rep='', border=1)
+            html_content += '\n</body>\n</html>'
 
-        buf = io.BytesIO(html_content.encode('utf-8'))
-        buf.seek(0)
+            results[job_id] = {
+                'status': 'done',
+                'filename': filename,
+                'data': html_content.encode('utf-8')
+            }
+        except Exception as ex:
+            results[job_id] = {'status': 'error', 'message': str(ex)}
 
-        return send_file(
-            buf,
-            as_attachment=True,
-            download_name=file.filename,
-            mimetype='application/vnd.ms-excel'
-        )
-    except Exception as e:
-        return f'Error: {str(e)}', 500
+    t = threading.Thread(target=process, args=(job_id, file_data, filename))
+    t.daemon = True
+    t.start()
+
+    return jsonify({'job_id': job_id})
+
+@app.route('/status/<job_id>')
+def check_status(job_id):
+    job = results.get(job_id)
+    if not job:
+        return jsonify({'status': 'error', 'message': 'Job tidak ditemukan'})
+    return jsonify({'status': job['status'], 'message': job.get('message', '')})
+
+@app.route('/download/<job_id>')
+def download(job_id):
+    job = results.get(job_id)
+    if not job or job['status'] != 'done':
+        return 'File belum siap', 404
+
+    buf = io.BytesIO(job['data'])
+    buf.seek(0)
+    filename = job['filename']
+
+    # Hapus dari memory setelah didownload
+    del results[job_id]
+
+    return send_file(buf, as_attachment=True, download_name=filename, mimetype='application/vnd.ms-excel')
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
+    port = int(os.environ.get('PORT', 8080))
     app.run(debug=False, host='0.0.0.0', port=port, threaded=True)
